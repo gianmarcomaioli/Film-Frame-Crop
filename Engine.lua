@@ -161,7 +161,13 @@ end
 -- Main command
 -- ------------------------------------------------------------------------
 
-local function cropPhotos(context)
+local function isUncropped(c)
+    return math.abs(c.CropLeft) < 1e-4 and math.abs(c.CropTop) < 1e-4 and
+        math.abs(c.CropRight - 1) < 1e-4 and math.abs(c.CropBottom - 1) < 1e-4 and
+        math.abs(c.CropAngle) < 1e-4
+end
+
+local function cropPhotos(context, likeActive)
     LrDialogs.attachErrorDialogToFunctionContext(context)
 
     local catalog = LrApplication.activeCatalog()
@@ -169,6 +175,32 @@ local function cropPhotos(context)
     if #selection == 0 then
         LrDialogs.message("Film Frame Crop", "Select one or more film scans first.", "info")
         return
+    end
+
+    -- "Like active photo": the active photo carries a hand-made crop for the others to follow.
+    local refPhoto, refName = nil, nil
+    if likeActive then
+        refPhoto = catalog:getTargetPhoto()
+        local inSelection = false
+        for _, photo in ipairs(selection) do
+            if refPhoto and photo.localIdentifier == refPhoto.localIdentifier then
+                inSelection = true
+            end
+        end
+        if not refPhoto or not inSelection or #selection < 2 then
+            LrDialogs.message("Film Frame Crop",
+                "Select the photo you cropped by hand together with the photos to crop like it. " ..
+                "Click the hand-cropped photo last, so it is the active (brightest) one in the filmstrip.",
+                "info")
+            return
+        end
+        if isUncropped(currentCrop(refPhoto:getDevelopSettings())) then
+            LrDialogs.message("Film Frame Crop",
+                "The active photo has no crop. Crop it by hand first, then select it with the others " ..
+                "and choose Crop Selected Like Active Photo again.", "info")
+            return
+        end
+        refName = refPhoto:getFormattedMetadata("fileName") or "the active photo"
     end
 
     local python, why = Engine.findPython()
@@ -187,6 +219,7 @@ local function cropPhotos(context)
                 name = photo:getFormattedMetadata("fileName") or "?",
                 original = currentCrop(dev),
                 orientation = orientationOf(dev),
+                isRef = (refPhoto ~= nil and photo.localIdentifier == refPhoto.localIdentifier),
             }
             items[#items + 1] = it
             byId[it.id] = it
@@ -273,7 +306,15 @@ local function cropPhotos(context)
         local lines = {}
         for _, it in ipairs(items) do
             if it.render then
-                lines[#lines + 1] = it.id .. "\t" .. it.render .. "\t" .. it.orientation
+                local line = it.id .. "\t" .. it.render .. "\t" .. it.orientation
+                if it.isRef then
+                    local c = it.original
+                    line = line .. "\tref\t" .. string.format("%.6f,%.6f,%.6f,%.6f,%.6f",
+                        c.CropLeft, c.CropTop, c.CropRight, c.CropBottom, c.CropAngle)
+                end
+                lines[#lines + 1] = line
+            elseif it.isRef then
+                error("The active photo could not be rendered: " .. tostring(it.error))
             end
         end
         if #lines == 0 then
@@ -315,7 +356,9 @@ local function cropPhotos(context)
             local f = splitTabs(line)
             local it = byId[f[1]]
             if it then
-                if f[2] == "ok" then
+                if f[2] == "ref" then
+                    it.refDone = true
+                elseif f[2] == "ok" then
                     it.result = {
                         CropLeft = tonumber(f[3]),
                         CropTop = tonumber(f[4]),
@@ -342,10 +385,15 @@ local function cropPhotos(context)
 
     -- 4. Apply the new crops; anything that failed gets its old crop back.
     progress:setCaption("Applying crops...")
-    local done, failed = 0, {}
+    local done, failed, total = 0, {}, 0
     catalog:withWriteAccessDo("Film Frame Crop", function()
         for _, it in ipairs(items) do
-            if it.result then
+            if not it.isRef then
+                total = total + 1
+            end
+            if it.isRef then
+                it.photo:applyDevelopSettings(it.original)    -- the reference keeps its own crop
+            elseif it.result then
                 it.photo:applyDevelopSettings(it.result)
                 done = done + 1
             else
@@ -371,15 +419,20 @@ local function cropPhotos(context)
             shown[#shown + 1] = "... and " .. (#failed - 15) .. " more"
         end
         LrDialogs.message("Film Frame Crop",
-            string.format("Cropped %d of %d photos. These were left as they were:\n\n%s",
-                done, #items, table.concat(shown, "\n")), "warning")
-    elseif #items > 1 then
-        LrDialogs.showBezel(string.format("Film Frame Crop: cropped %d photos", done))
+            string.format("Cropped %d of %d photos%s. These were left as they were:\n\n%s",
+                done, total, refName and (" like " .. refName) or "", table.concat(shown, "\n")), "warning")
+    elseif total > 1 or refName then
+        LrDialogs.showBezel(string.format("Film Frame Crop: cropped %d photos%s", done,
+            refName and (" like " .. refName) or ""))
     end
 end
 
-function Engine.run()
-    LrFunctionContext.postAsyncTaskWithContext("FilmFrameCrop", cropPhotos)
+-- opts.likeActive: crop the selection like the active photo's hand-made crop
+function Engine.run(opts)
+    local likeActive = opts and opts.likeActive or false
+    LrFunctionContext.postAsyncTaskWithContext("FilmFrameCrop", function(context)
+        cropPhotos(context, likeActive)
+    end)
 end
 
 return Engine

@@ -18,6 +18,11 @@ return {
             enabledWhen = "photosSelected",
         },
         {
+            title = "Film Frame Crop: Crop Selected Like Active Photo",
+            file = "CropLikeActive.lua",
+            enabledWhen = "photosSelected",
+        },
+        {
             title = "Film Frame Crop: Settings...",
             file = "SettingsDialog.lua",
         },
@@ -25,5 +30,5 @@ return {
 
     LrPluginInfoProvider = "PluginInfo.lua",
 
-    VERSION = { major = 1, minor = 2, revision = 0 },
+    VERSION = { major = 1, minor = 4, revision = 0 },
 }

@@ -13,10 +13,14 @@ Usage:
 
 Job file: one line per image, tab separated:
     <id> <TAB> <path to rendered JPEG> <TAB> <Lightroom orientation code, e.g. AB>
+At most one line may be a reference, a photo cropped by hand for the others to
+follow; it adds two fields:
+    ... <TAB> ref <TAB> <CropLeft>,<CropTop>,<CropRight>,<CropBottom>,<CropAngle>
 
 Result file: one line per image, tab separated:
     <id> <TAB> ok <TAB> left <TAB> top <TAB> right <TAB> bottom <TAB> angle <TAB> note
     <id> <TAB> fail <TAB> <reason>
+    <id> <TAB> ref <TAB> <note>          (the reference: left as it is)
 
 Requires: numpy, opencv-python  (python3 -m pip install numpy opencv-python)
 """
@@ -503,6 +507,152 @@ def refine_edges_profile(pix, rect):
     return (float(c[0]), float(c[1]), float(nx1 - nx0), float(ny1 - ny0), theta)
 
 
+def _gutter_cut(cov, sd, mean, flat_sd, base_L, lo, hi, n_min, n_max, reach):
+    """
+    cov, sd, mean: picture coverage, lightness spread and mean lightness per
+    column (or row) of the deskewed scan. Find bands of clear film between two
+    frames near either end of the frame lo..hi. A band counts when it lies at
+    least partly inside the frame, or when it lies just outside it with another
+    frame beyond. Returns (new_lo, new_hi, lo_limit, hi_limit): the boundaries
+    after cutting at a band's inner side, and where a band fixes each side
+    (None where there is none).
+    """
+    N = len(cov)
+    n = hi - lo
+    ext = int(round(0.12 * n))
+    # clear film is the lightest thing on a negative: a flat but darker band is picture
+    gut = (cov <= 0.08) & (sd <= flat_sd) & (mean >= base_L - 4.0)
+    runs, i = [], max(0, lo - ext)
+    stop = min(N, hi + ext)
+    while i < stop:
+        if gut[i]:
+            j = i
+            while j < stop and gut[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    # a hairline across the gap (a scratch, a guide mark) must not split it in two
+    gap = max(3, int(round(0.006 * n)))
+    merged = []
+    for a, b in runs:
+        if merged and a - merged[-1][1] <= gap:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    runs = merged
+    look = max(3, int(round(0.01 * n)))
+    lo_lim = hi_lim = None
+    for a, b in runs:
+        width = b - a
+        if width < n_min or width > n_max:
+            continue
+        if b <= lo + reach * n and b > lo - ext // 2:
+            # near the start: inside the frame, or just outside with a frame beyond
+            beyond = cov[max(0, a - look):a]
+            if b > lo + 1 or (len(beyond) and beyond.mean() >= 0.5):
+                lo_lim = b if lo_lim is None else max(lo_lim, b)
+        elif a >= hi - reach * n and a < hi + ext // 2:
+            beyond = cov[b:min(N, b + look)]
+            if a < hi - 1 or (len(beyond) and beyond.mean() >= 0.5):
+                hi_lim = a if hi_lim is None else min(hi_lim, a)
+    new_lo = max(lo, lo_lim) if lo_lim is not None else lo
+    new_hi = min(hi, hi_lim) if hi_lim is not None else hi
+    if new_hi - new_lo < 0.5 * n:
+        return lo, hi, None, None
+    return new_lo, new_hi, lo_lim, hi_lim
+
+
+def split_gutters(lab, pix, rect, base_L):
+    """
+    When the film strip runs off the scan, the clear gap between two frames and
+    a slice of the neighbouring frame can join the frame itself. Cut the frame
+    at any full-length band of flat, picture-free film near its sides. Returns
+    (rect, limits): limits gives, for the left, right, top and bottom edges,
+    the position (along the frame's axes) that a gap fixes, or None.
+    """
+    cx, cy, w, h, theta = rect
+    H, W = lab.shape[:2]
+    rot = deskew(lab[..., 0], (cx, cy), theta, interp=cv2.INTER_LINEAR)
+    pr = deskew(pix.astype(np.uint8), (cx, cy), theta).astype(np.float32)
+    valid = deskew(np.ones((H, W), np.uint8), (cx, cy), theta) > 0
+    x0, x1 = int(round(max(0, cx - w / 2))), int(round(min(W, cx + w / 2)))
+    y0, y1 = int(round(max(0, cy - h / 2))), int(round(min(H, cy + h / 2)))
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        return rect, None
+
+    def profiles(axis):
+        # along the frame's length, leaving out its ends
+        if axis == 0:
+            a, b = int(y0 + 0.1 * (y1 - y0)), int(y1 - 0.1 * (y1 - y0))
+            Ls, ps, vs = rot[a:b, :], pr[a:b, :], valid[a:b, :]
+        else:
+            a, b = int(x0 + 0.1 * (x1 - x0)), int(x1 - 0.1 * (x1 - x0))
+            Ls, ps, vs = rot[:, a:b].T, pr[:, a:b].T, valid[:, a:b].T
+        cnt = np.maximum(vs.sum(axis=0), 1)
+        cov = (ps * vs).sum(axis=0) / cnt
+        mean = (Ls * vs).sum(axis=0) / cnt
+        sd = np.sqrt(np.maximum((Ls * Ls * vs).sum(axis=0) / cnt - mean * mean, 0))
+        cov[vs.sum(axis=0) < 10] = 1.0               # outside the scan: never a gutter
+        return cov, sd, mean
+
+    cov_c, sd_c, mean_c = profiles(0)
+    cov_r, sd_r, mean_r = profiles(1)
+    pic = np.concatenate([sd_c[x0:x1][cov_c[x0:x1] > 0.5], sd_r[y0:y1][cov_r[y0:y1] > 0.5]])
+    pic_sd = float(np.median(pic)) if pic.size else 4.0
+    flat_sd = max(2.0, 0.35 * pic_sd)
+    nx0, nx1, lx0, lx1 = _gutter_cut(cov_c, sd_c, mean_c, flat_sd, base_L, x0, x1,
+                                     max(3, 0.008 * (x1 - x0)), 0.12 * (x1 - x0), 0.22)
+    ny0, ny1, ly0, ly1 = _gutter_cut(cov_r, sd_r, mean_r, flat_sd, base_L, y0, y1,
+                                     max(3, 0.008 * (y1 - y0)), 0.12 * (y1 - y0), 0.22)
+    # deskewed positions -> positions along the frame's axes
+    u, v = axes(theta)
+    du = cx * u[0] + cy * u[1] - cx
+    dv = cx * v[0] + cy * v[1] - cy
+    limits = [None if lx0 is None else lx0 + du, None if lx1 is None else lx1 + du,
+              None if ly0 is None else ly0 + dv, None if ly1 is None else ly1 + dv]
+    if all(l is None for l in limits):
+        limits = None
+    if (nx0, nx1, ny0, ny1) == (x0, x1, y0, y1):
+        return rect, limits
+    c = unrotate_point(((nx0 + nx1) / 2, (ny0 + ny1) / 2), (cx, cy), theta)
+    return (float(c[0]), float(c[1]), float(nx1 - nx0), float(ny1 - ny0), theta), limits
+
+
+def _edges(rect):
+    """Positions of the four edges along the frame's own axes (independent of its centre)."""
+    cx, cy, w, h, theta = rect
+    u, v = axes(theta)
+    pu = cx * u[0] + cy * u[1]
+    pv = cx * v[0] + cy * v[1]
+    return [pu - w / 2, pu + w / 2, pv - h / 2, pv + h / 2]
+
+
+def _from_edges(e, theta):
+    u, v = axes(theta)
+    pu, pv = (e[0] + e[1]) / 2, (e[2] + e[3]) / 2
+    c = pu * np.asarray(u) + pv * np.asarray(v)
+    return (float(c[0]), float(c[1]), float(e[1] - e[0]), float(e[3] - e[2]), theta)
+
+
+def _apply_limits(rect, limits, tol):
+    """
+    A side next to a gap between frames sits where the exposure starts. Later
+    steps may move it inward by at most tol (flat, pale picture next to the gap
+    must not pull it further in) and never outward into the gap.
+    """
+    if not limits:
+        return rect
+    e = _edges(rect)
+    for i in range(4):
+        if limits[i] is not None:
+            inward = 1 if i in (0, 2) else -1        # left/top grow inward, right/bottom shrink
+            lo_, hi_ = sorted((limits[i], limits[i] + inward * tol))
+            e[i] = min(max(e[i], lo_), hi_)
+    return _from_edges(e, rect[4])
+
+
 def estimate_angle_projection(L, rect, max_angle):
     """
     Find the tilt that makes the straight structures around the frame (frame
@@ -557,6 +707,25 @@ def _step_edge(prof, base, start, outward, base_L):
     n = len(prof)
     start = int(min(n - 1, max(0, start)))
     L = prof[:, 0]
+    # 0. the edge may already sit past the film, in the holder or the light,
+    # with the clear rebate along the film's edge inside it. Walk in across the
+    # rebate to where the picture starts.
+    if L[start] < 0.5 * base_L or L[start] > base_L + 6:
+        dE = np.linalg.norm(prof - base, axis=1)
+        lim = max(6, int(round(0.04 * n)))
+        j, k = start, 0
+        while 0 <= j < n and k < lim and dE[j] >= 12:      # across the holder's blurred edge
+            j -= outward
+            k += 1
+        if not (0 <= j < n) or dE[j] >= 12:
+            return None                                    # no rebate: leave the edge alone
+        p = j
+        while 0 <= p < n and k < lim and dE[p] < 12:       # across the rebate
+            p -= outward
+            k += 1
+        if not (0 <= p < n) or dE[p] < 12:
+            return None                                    # base-like for too long: pale picture
+        return p
     # 1. walk outward to where the film ends (holder or light)
     i = start
     while 0 <= i < n:
@@ -596,8 +765,12 @@ def _step_edge(prof, base, start, outward, base_L):
     return None
 
 
-def refine_edges_step(lab, base, rect):
-    """Snap each edge to the colour step between frame and film base."""
+def refine_edges_step(lab, base, rect, found=None):
+    """
+    Snap each edge to the colour step between frame and film base. If found is
+    a list, it receives four flags (left, right, top, bottom): True where a
+    clear step was found.
+    """
     cx, cy, w, h, theta = rect
     H, W = lab.shape[:2]
     rot = deskew(lab, (cx, cy), theta, interp=cv2.INTER_LINEAR)
@@ -620,6 +793,8 @@ def refine_edges_step(lab, base, rect):
     R = _step_edge(colprof, base, x1, +1, bL)
     T = _step_edge(rowprof, base, y0, -1, bL)
     B = _step_edge(rowprof, base, y1, +1, bL)
+    if found is not None:
+        found[:] = [L is not None, R is not None, T is not None, B is not None]
     nx0 = float(L) if L is not None else x0
     nx1 = float(R) if R is not None else x1
     ny0 = float(T) if T is not None else y0
@@ -712,10 +887,16 @@ def detect_frame(img, film="auto", sensitivity=1.0, max_angle=5.0, inset_pct=1.0
         rect = rect[:4] + (a,)
 
     rect = refine_edges(comp, rect, run)
+    rect, limits = split_gutters(lab, pix, rect, float(base[0]))
     for _ in range(2):
         rect = refine_edges_profile(pix, rect)
+    found = [False] * 4
     for _ in range(2):
-        rect = refine_edges_step(lab, base, rect)
+        rect = refine_edges_step(lab, base, rect, found)
+    rect = _apply_limits(rect, limits, tol=0.004 * max(w, h))
+    # an edge is sure when it sits at a clear step or next to a gap between frames
+    sure = [bool(found[i] or (limits is not None and limits[i] is not None)) for i in range(4)]
+    frame = rect
 
     inset = inset_pct / 100.0 * min(rect[2], rect[3])
     rect = (rect[0], rect[1], rect[2] - 2 * inset, rect[3] - 2 * inset, rect[4])
@@ -725,8 +906,81 @@ def detect_frame(img, film="auto", sensitivity=1.0, max_angle=5.0, inset_pct=1.0
     # back to the resolution of the rendered image
     full = (rect[0] / scale, rect[1] / scale, rect[2] / scale, rect[3] / scale, rect[4])
     info = {"film": film_used, "threshold": thresh, "ratio": snapped,
-            "work": work, "mask": comp, "work_rect": rect}
+            "work": work, "mask": comp, "work_rect": rect, "sure": sure,
+            "frame": (frame[0] / scale, frame[1] / scale, frame[2] / scale, frame[3] / scale, frame[4])}
     return full, info
+
+
+# --------------------------------------------------------------------------
+# Cropping like a reference photo
+# --------------------------------------------------------------------------
+
+QUARTER_TURNS = {"BC", "DA", "CB", "AD"}   # orientation codes that swap width and height
+
+
+def reference_from(crop_rect, frame_rect, orientation):
+    """
+    Describe a hand-made crop by its size and by where it sits inside the
+    frame: the distance of each crop edge from the matching frame edge, along
+    the frame's axes. frame_rect may be None when the frame was not found.
+    """
+    ref = {"w": crop_rect[2], "h": crop_rect[3], "angle": crop_rect[4],
+           "quarter": (orientation or "AB").upper() in QUARTER_TURNS, "frame": None}
+    if frame_rect is not None:
+        f = _edges((frame_rect[0], frame_rect[1], frame_rect[2], frame_rect[3], crop_rect[4]))
+        c = _edges(crop_rect)
+        ref["frame"] = (frame_rect[2], frame_rect[3])
+        ref["inset"] = (c[0] - f[0], f[1] - c[1], c[2] - f[2], f[3] - c[3])
+    return ref
+
+
+def _place(f_lo, f_hi, sure_lo, sure_hi, size, in_lo, in_hi, ref_frame, margin):
+    """
+    Place a crop of the given size along one axis of a detected frame (edges
+    f_lo, f_hi). in_lo, in_hi: the reference crop's distance from its frame's
+    edges. The crop never reaches past the frame: where the frame is smaller
+    than the crop plus margin, the crop is trimmed to fit.
+    """
+    span = f_hi - f_lo
+    if ref_frame is not None and abs(span - ref_frame) > 0.02 * ref_frame:
+        # the frame came out a different size from the reference's: one edge is
+        # probably wrong, so hang the crop from the edge the detector is sure of
+        if sure_lo and not sure_hi:
+            lo = f_lo + max(in_lo, margin)
+            return lo, lo + size
+        if sure_hi and not sure_lo:
+            hi = f_hi - max(in_hi, margin)
+            return hi - size, hi
+    room = span - size                       # space left around the crop
+    if room < 2 * margin:
+        # frame smaller than the crop: trim the crop to fit, centred
+        return f_lo + margin, f_hi - margin
+    # share the room in the same proportion as the reference crop did
+    total = in_lo + in_hi
+    share = in_lo / total if total > 1e-6 else 0.5
+    lo = f_lo + margin + (room - 2 * margin) * share
+    return lo, lo + size
+
+
+def crop_like(ref, frame, sure, orientation, ref_long, long_edge):
+    """A crop for a detected frame, the size and position of the reference crop."""
+    k = long_edge / float(ref_long)
+    w, h = ref["w"] * k, ref["h"] * k
+    quarter = (orientation or "AB").upper() in QUARTER_TURNS
+    swapped = quarter != ref["quarter"]
+    if swapped:
+        w, h = h, w
+    e = _edges(frame)
+    if ref["frame"] is None or swapped:
+        # no position to copy: centre the crop on the frame
+        cu, cv_ = (e[0] + e[1]) / 2, (e[2] + e[3]) / 2
+        return _from_edges([cu - w / 2, cu + w / 2, cv_ - h / 2, cv_ + h / 2], frame[4])
+    ins = [x * k for x in ref["inset"]]
+    fw, fh = ref["frame"][0] * k, ref["frame"][1] * k
+    margin = 0.002 * max(frame[2], frame[3])   # never closer than this to a frame edge
+    x0, x1 = _place(e[0], e[1], sure[0], sure[1], w, ins[0], ins[1], fw, margin)
+    y0, y1 = _place(e[2], e[3], sure[2], sure[3], h, ins[2], ins[3], fh, margin)
+    return _from_edges([x0, x1, y0, y1], frame[4])
 
 
 def save_debug(path, info):
@@ -751,17 +1005,58 @@ def run_job(args):
     results = []
     with open(args.job, "r", encoding="utf-8") as f:
         lines = [ln.rstrip("\r\n") for ln in f if ln.strip()]
+    # a line marked "ref" carries a hand-made crop for the others to follow
+    ref, ref_long, ref_failed = None, None, False
+    for ln in lines:
+        parts = ln.split("\t")
+        if len(parts) > 4 and parts[3] == "ref":
+            pid = parts[0]
+            try:
+                orientation = parts[2]
+                img = read_image(parts[1])
+                H, W = img.shape[:2]
+                l, t, r, b, a = (float(x) for x in parts[4].split(","))
+                crop = lightroom_to_rect(l, t, r, b, a, W, H, orientation)
+                try:
+                    _, info = detect_frame(img, film=args.film, sensitivity=args.sensitivity,
+                                           max_angle=args.max_angle, inset_pct=0.0, aspect="free")
+                    frame = info["frame"]
+                except Exception:
+                    frame = None
+                ref, ref_long = reference_from(crop, frame, orientation), max(W, H)
+                results.append("\t".join([pid, "ref", "reference" + ("" if frame else " (frame not found)")]))
+            except Exception as e:
+                msg = str(e).replace("\t", " ").replace("\n", " ") or e.__class__.__name__
+                results.append("\t".join([pid, "fail", "reference: " + msg]))
+                ref_failed = True
+                if args.verbose:
+                    traceback.print_exc()
+            break
     for ln in lines:
         parts = ln.split("\t")
         pid = parts[0]
+        if len(parts) > 4 and parts[3] == "ref":
+            continue
+        if ref_failed:
+            results.append("\t".join([pid, "fail", "the reference photo could not be read"]))
+            continue
         try:
             path = parts[1]
             orientation = parts[2] if len(parts) > 2 else "AB"
             img = read_image(path)
             H, W = img.shape[:2]
-            rect, info = detect_frame(img, film=args.film, sensitivity=args.sensitivity,
-                                      max_angle=args.max_angle, inset_pct=args.inset,
-                                      aspect=args.aspect)
+            if ref is not None:
+                _, info = detect_frame(img, film=args.film, sensitivity=args.sensitivity,
+                                       max_angle=args.max_angle, inset_pct=0.0, aspect="free")
+                rect = crop_like(ref, info["frame"], info["sure"], orientation, ref_long, max(W, H))
+                rect = fit_inside(rect, W, H)
+                k = max(info["work"].shape[:2]) / float(max(W, H))
+                info["work_rect"] = (rect[0] * k, rect[1] * k, rect[2] * k, rect[3] * k, rect[4])
+                info["ratio"] = "like reference"
+            else:
+                rect, info = detect_frame(img, film=args.film, sensitivity=args.sensitivity,
+                                          max_angle=args.max_angle, inset_pct=args.inset,
+                                          aspect=args.aspect)
             l, t, r, b, a = rect_to_lightroom(rect, W, H, orientation, args.flip_angle)
             note = info["film"] + ((" " + info["ratio"]) if info["ratio"] else "")
             results.append("\t".join([pid, "ok"] + ["%.6f" % x for x in (l, t, r, b, a)] + [note]))

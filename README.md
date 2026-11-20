@@ -23,6 +23,28 @@ All commands are under **File > Plug-in Extras** and work in any module.
 
 - **Crop Selected Scans** crops each selected photo to its exposed frame.
 If a photo can't be cropped, it keeps its previous crop and is listed at the end.
+- **Crop Selected Like Active Photo** crops the selection the way you cropped
+one photo by hand. Every photo gets a crop of the same size, placed in the same
+position relative to its own frame, so a whole roll matches.
+
+### Cropping a roll like one photo
+
+1. Crop one frame of the roll by hand, the way you like it.
+2. Select the frames you want cropped, then click the hand-cropped frame last,
+so it is the active (brightest) photo in the filmstrip.
+3. Choose **File > Plug-in Extras > Film Frame Crop: Crop Selected Like Active Photo**.
+
+The hand-cropped photo keeps its crop. Each other photo is found as usual, and
+a crop of your size is placed where yours sits in your frame: if you cropped
+more off the left than the right, so will the others. When a frame comes out a
+different size from yours, which means one of its edges was misread, the crop
+is hung from the edge the plugin is sure of. A crop never reaches past the
+frame: on a smaller frame it is trimmed to fit.
+
+Use it for frames scanned in one session, with the same camera position and
+holder. The tilt is measured on each frame, since every frame sits a little
+differently in the holder. Inset and Aspect ratio are not applied in this mode,
+because your crop already sets both.
 
 ## The Process
 For each photo, cropping works in three stages:
@@ -60,15 +82,22 @@ that differs from the base, and is neither backlight nor holder, is marked as
 image, and the largest such region is taken as the frame.
 3. **Tilt.** The angle is found by rotating the frame slightly in both
 directions and keeping the angle at which its edges are sharpest.
-4. **Edges.** In the straightened image, each edge is located precisely by
-walking inward from the holder until the brightness steps from base to image.
-5. **Lightroom crop.** The result is converted to Lightroom's own crop values,
+4. **Gaps between frames.** When the film strip runs off the edge of the scan,
+the clear gap between two frames, and a slice of the next frame, can look like
+part of the frame. A band of flat, clear film running the full length of the
+frame near one of its sides is recognised as such a gap, and the frame is cut
+where the gap ends.
+5. **Edges.** In the straightened image, each edge is located precisely by
+walking inward from the holder, across the clear edge of the film, until the
+brightness steps from base to image.
+6. **Lightroom crop.** The result is converted to Lightroom's own crop values,
 two opposite corners in the original, unrotated image plus a clockwise angle,
 so camera rotation and mirroring are handled.
 
 ## Limitations
 
-- It expects one frame per scan. With a strip of several frames, it crops to the largest.
+- It expects one frame per scan, with at most a slice of the neighbouring
+frames showing. With a strip of several whole frames, it crops to the largest.
 - If a negative's whole edge is deep shadow, that is the same density as the
 base, so the crop can come in slightly on that side.
 - Scans with no film base visible at all are cropped to the image edge, minus the inset.
